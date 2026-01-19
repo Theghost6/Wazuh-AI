@@ -18,7 +18,7 @@ docker-compose -f generate-indexer-certs.yml run --rm generator
 
 ### Bước 3: Khởi động Wazuh
 ```bash
-docker-compose up -d
+docker-compose up --build -d
 ```
 
 ## Truy cập
