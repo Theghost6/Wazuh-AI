@@ -41,7 +41,7 @@
     <description>File deleted in Windows Downloads directory</description>
   </rule>
 
-<rule id="100015" level="3">
+<rule id="100016" level="3">
   <match>Linux-Sysmon</match>
   <description>Sysmon for Linux event collected</description>
   <group>syslog,journald,json</group>
@@ -49,28 +49,52 @@
 
 </group>
 <group name="ai_alerts,">
-  <rule id="100010" level="3">
-    <match>AI_TEST</match>
-    <description>AI test log detected</description>
-    <group>web,apache,nginx,ids,ai_test_group,</group>
-  </rule>
-
-  <rule id="100014" level="14">
-    <if_sid>100010</if_sid>
-    <description>AI TEST (HIGH): Payload resembles XSS/SQLi</description>
-    <group>attack,ai_detection,</group>
-  </rule>
-
+  <!-- Base rule: AI đọc JSON từ active-responses.log (PHẢI ĐẶT TRƯỚC 100010) -->
   <rule id="100011" level="3">
     <decoded_as>json</decoded_as>
     <location>/var/ossec/logs/active-responses.log</location>
-    <description>AI Analysis: Data received from AI model.</description>
+    <field name="ai_prediction">\.+</field>
+    <description>AI Analysis: Dữ liệu từ AI model</description>
   </rule>
 
+  <!-- Rule cho test log đầu vào (không phải từ active-responses) -->
+  <rule id="100010" level="3">
+    <match>AI_TEST</match>
+    <description>AI test log detected - Đang phân tích...</description>
+    <group>web,apache,nginx,ids,ai_test_group,</group>
+  </rule>
+
+  <!-- XSS Detection - Level 14 (High) -->
+  <rule id="100012" level="14">
+    <if_sid>100011</if_sid>
+    <field name="ai_prediction">^XSS$</field>
+    <description>🚨 AI PHÁT HIỆN TẤN CÔNG XSS - Độ tin cậy: $(ai_confidence_pct)% | XSS=$(ai_details.xss_pct)%, SQLi=$(ai_details.sqli_pct)%, Benign=$(ai_details.benign_pct)%</description>
+    <group>attack,xss,ai_detection,</group>
+  </rule>
+
+  <!-- SQLi Detection - Level 14 (High) -->
   <rule id="100013" level="14">
     <if_sid>100011</if_sid>
-    <field name="ai_prediction">[xX][sS][sS]|[sS][qQ][lL][iI]</field>
-    <description>AI CẢNH BÁO (HIGH): Phát hiện tấn công $(ai_prediction) (Confidence: $(ai_confidence))</description>
+    <field name="ai_prediction">^SQLi$</field>
+    <description>🚨 AI PHÁT HIỆN TẤN CÔNG SQL INJECTION - Độ tin cậy: $(ai_confidence_pct)% | SQLi=$(ai_details.sqli_pct)%, XSS=$(ai_details.xss_pct)%, Benign=$(ai_details.benign_pct)%</description>
+    <group>attack,sqli,ai_detection,</group>
+  </rule>
+
+  <!-- Generic Attack (fallback) - Level 12 -->
+  <rule id="100014" level="12">
+    <if_sid>100011</if_sid>
+    <field name="ai_is_attack">^true$</field>
+    <description>⚠️ AI CẢNH BÁO: Phát hiện $(ai_prediction) - Độ tin cậy: $(ai_confidence_pct)%</description>
     <group>attack,ai_detection,</group>
   </rule>
+
+  <!-- Benign - Level 3 (Info) -->
+  <rule id="100015" level="3">
+    <if_sid>100011</if_sid>
+    <field name="ai_prediction">^Benign$</field>
+    <description>AI: Request an toàn (Benign: $(ai_details.benign_pct)%)</description>
+    <group>ai_detection,</group>
+  </rule>
+
 </group>
+
