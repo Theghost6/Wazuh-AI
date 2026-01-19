@@ -1,0 +1,83 @@
+#!/var/ossec/framework/python/bin/python3
+import sys
+import json
+import requests
+from datetime import datetime
+
+# Ghi log debug vào file integrations.log để theo dõi
+def log_debug(message):
+    with open('/var/ossec/logs/integrations.log', 'a') as f:
+        f.write(f"[{datetime.utcnow().isoformat()}] custom-ai: {message}\n")
+
+def log_json(data):
+    with open('/var/ossec/logs/active-responses.log', 'a') as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+try:
+    # 1. Đọc dữ liệu alert từ tham số Wazuh truyền vào
+    alert_file = sys.argv[1]
+    with open(alert_file) as f:
+        alert_json = json.load(f)
+
+    # Skip AI-generated alerts to prevent recursion
+    rule = alert_json.get("rule", {})
+    rule_id = str(rule.get("id") or "")
+    if rule_id == "100011":
+        log_debug("Skip AI alert to prevent recursion")
+        sys.exit(0)
+    
+    log_content = alert_json.get('full_log', str(alert_json))
+    log_debug(f"Đang xử lý log: {log_content[:120]}...")
+
+    # 2. Gửi sang AI API (ưu tiên hook_url từ Wazuh nếu có)
+    AI_API_URL = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "http://ai-api:5000/predict"
+    r = requests.post(AI_API_URL, json={"log_content": log_content}, timeout=5)
+
+    log_debug(f"AI Response: {r.status_code}")
+
+    ai_result = {}
+    try:
+        ai_result = r.json()
+    except Exception:
+        ai_result = {"error": "invalid_json", "raw": r.text[:300]}
+
+    # Normalize fields from different APIs
+    ai_label = ai_result.get("prediction") or ai_result.get("label") or ai_result.get("ai_prediction") or "Unknown"
+    ai_confidence = ai_result.get("confidence")
+    if isinstance(ai_confidence, (int, float)):
+        ai_confidence = float(ai_confidence)
+    ai_is_attack = ai_result.get("is_attack")
+    if ai_is_attack is None:
+        ai_is_attack = ai_result.get("is_xss")
+    if ai_is_attack is None:
+        ai_is_attack = str(ai_label).lower() not in ("benign", "clean")
+
+    if not ai_is_attack:
+        log_debug(f"Benign prediction ({ai_label}); skip active-responses log")
+        sys.exit(0)
+
+    if ai_confidence is not None and ai_confidence < 0.7:
+        log_debug(f"Low confidence ({ai_confidence}); skip active-responses log")
+        sys.exit(0)
+
+    # Pull useful fields from alert
+    agent = alert_json.get("agent", {})
+    data = alert_json.get("data", {})
+
+    log_json({
+        "ai_prediction": ai_label,
+        "ai_confidence": ai_confidence,
+        "ai_is_attack": ai_is_attack,
+        "ai_raw": ai_result,
+        "rule_id": rule.get("id"),
+        "rule_description": rule.get("description"),
+        "agent_id": agent.get("id"),
+        "agent_name": agent.get("name"),
+        "srcip": data.get("srcip") or alert_json.get("srcip"),
+        "url": data.get("url") or alert_json.get("url"),
+        "status": data.get("status") or alert_json.get("status"),
+        "full_log": log_content[:1000]
+    })
+
+except Exception as e:
+    log_debug(f"Lỗi: {str(e)}")
