@@ -52,7 +52,6 @@
   <!-- Base rule: AI đọc JSON từ active-responses.log (PHẢI ĐẶT TRƯỚC 100010) -->
   <rule id="100011" level="3">
     <decoded_as>json</decoded_as>
-    <location>/var/ossec/logs/active-responses.log</location>
     <field name="ai_prediction">\.+</field>
     <description>AI Analysis: Dữ liệu từ AI model</description>
   </rule>
@@ -80,12 +79,35 @@
     <group>attack,sqli,ai_detection,</group>
   </rule>
 
+  <!-- Command Injection Detection - Level 14 (High) -->
+  <rule id="100017" level="14">
+    <if_sid>100011</if_sid>
+    <field name="ai_prediction">^CMDi$</field>
+    <description>🚨 AI PHÁT HIỆN TẤN CÔNG COMMAND INJECTION - Độ tin cậy: $(ai_confidence_pct)% | CMDi=$(ai_details.cmdi_pct)%, SQLi=$(ai_details.sqli_pct)%, XSS=$(ai_details.xss_pct)%</description>
+    <group>attack,cmdi,ai_detection,</group>
+  </rule>
+
   <!-- Generic Attack (fallback) - Level 12 -->
   <rule id="100014" level="12">
     <if_sid>100011</if_sid>
     <field name="ai_is_attack">^true$</field>
     <description>⚠️ AI CẢNH BÁO: Phát hiện $(ai_prediction) - Độ tin cậy: $(ai_confidence_pct)%</description>
     <group>attack,ai_detection,</group>
+  </rule>
+
+  <!-- Override rule 31108 (level 0) to ensure POST requests are analyzed by AI -->
+  <rule id="100019" level="6">
+    <if_sid>31108</if_sid>
+    <match>POST</match>
+    <description>POST Request - AI Analysis Required (override 31108)</description>
+    <group>web,apache,nginx,ids,attack,</group>
+  </rule>
+
+  <!-- Hook Rule: Forward ALL Web Logs to AI for analysis -->
+  <rule id="100018" level="6">
+    <decoded_as>web-accesslog</decoded_as>
+    <description>Web Access Log - AI Analysis Required</description>
+    <group>web,apache,nginx,ids,attack,</group>
   </rule>
 
   <!-- Benign - Level 3 (Info) -->
