@@ -1,7 +1,10 @@
 #!/var/ossec/framework/python/bin/python3
 import sys
 import json
-import requests
+import re # Added regex support
+import urllib.request 
+import urllib.parse # Use urllib.parse for unquote
+
 from datetime import datetime
 
 # Ghi log debug vào file integrations.log để theo dõi
@@ -19,32 +22,65 @@ try:
     with open(alert_file) as f:
         alert_json = json.load(f)
 
+    # Move extraction up
+    data = alert_json.get("data", {})
+    full_log = alert_json.get('full_log', '')
+
     # Skip AI-generated alerts to prevent recursion
     rule = alert_json.get("rule", {})
     rule_id = str(rule.get("id") or "")
-    if rule_id in ["100011", "100012", "100013", "100014", "100015"]:
+    if rule_id in ["100011", "100012", "100013", "100014", "100015", "100017"]:
         log_debug(f"Skip AI alert (rule {rule_id}) to prevent recursion")
         sys.exit(0)
     
-    # Lấy full_log - nếu không có thì skip
-    log_content = alert_json.get('full_log', '')
-    if not log_content:
-        log_debug("No full_log found, skipping")
+    # --- INTELLIGENT PAYLOAD EXTRACTION ---
+    # UPDATED: Send the FULL LOG to the API and let api.py handle extraction
+    # This ensures we don't miss attacks in POST Body, Referer, Headers, etc.
+    target_text = ""
+    
+    if full_log:
+        target_text = full_log
+        log_debug("Using full_log for AI analysis")
+    elif data.get("url"):
+        target_text = str(data.get("url"))
+        log_debug(f"Found URL field: {target_text}")
+    
+    if not target_text:
+        log_debug("No content to analyze, skipping")
         sys.exit(0)
     
-    log_debug(f"Đang xử lý log: {log_content[:120]}...")
+    # URL Decode is NO LONGER NEEDED here because api.py handles it better
+    # And decoding full_log might break its structure
 
-    # 2. Gửi sang AI API (ưu tiên hook_url từ Wazuh nếu có)
+    # 2. Gửi sang AI API
     AI_API_URL = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "http://ai-api:5000/predict"
-    r = requests.post(AI_API_URL, json={"log_content": log_content}, timeout=5)
-
-    log_debug(f"AI Response: {r.status_code}")
-
+    
     ai_result = {}
     try:
-        ai_result = r.json()
-    except Exception:
-        ai_result = {"error": "invalid_json", "raw": r.text[:300]}
+        data_bytes = json.dumps({"text": target_text}).encode('utf-8')
+        req = urllib.request.Request(AI_API_URL, data=data_bytes, headers={'Content-Type': 'application/json'})
+        
+        with urllib.request.urlopen(req, timeout=5) as response:
+            resp_body = response.read().decode('utf-8')
+            log_debug(f"AI Response Code: {response.getcode()}")
+            ai_result = json.loads(resp_body)
+            
+    except urllib.error.HTTPError as e:
+        if e.code == 500:
+            try:
+                resp_body = e.read().decode('utf-8')
+                log_debug(f"AI Attack Detected (HTTP 500): {resp_body}")
+                ai_result = json.loads(resp_body)
+            except Exception as parse_err:
+                 log_debug(f"Failed to parse 500 body: {parse_err}")
+                 ai_result = {"error": "invalid_json_500", "raw": str(e)}
+        else:
+            log_debug(f"Error calling AI API (HTTP {e.code}): {e}")
+            ai_result = {"error": "api_call_failed", "raw": str(e)}
+
+    except Exception as e:
+        log_debug(f"Error calling AI API: {e}")
+        ai_result = {"error": "api_call_failed", "raw": str(e)}
 
     # Normalize fields from different APIs
     ai_label = ai_result.get("prediction") or ai_result.get("label") or ai_result.get("ai_prediction") or "Unknown"
@@ -61,7 +97,7 @@ try:
         log_debug(f"Benign prediction ({ai_label}); skip active-responses log")
         sys.exit(0)
 
-    if ai_confidence is not None and ai_confidence < 0.7:
+    if ai_confidence is not None and ai_confidence < 70:
         log_debug(f"Low confidence ({ai_confidence}); skip active-responses log")
         sys.exit(0)
 
@@ -69,12 +105,17 @@ try:
     agent = alert_json.get("agent", {})
     data = alert_json.get("data", {})
     
-    # Get detailed probabilities from AI response
-    details = ai_result.get("details", {})
-    benign_pct = round(details.get("Benign", 0) * 100, 1)
-    xss_pct = round(details.get("XSS", 0) * 100, 1)
-    sqli_pct = round(details.get("SQLi", 0) * 100, 1)
-    confidence_pct = round((ai_confidence or 0) * 100, 1)
+    # Get detailed probabilities from AI response (V5 API returns "probabilities")
+    probabilities = ai_result.get("probabilities", {})
+    benign_pct = round(probabilities.get("Benign", 0), 2)
+    xss_pct = round(probabilities.get("XSS", 0), 2)
+    sqli_pct = round(probabilities.get("SQLi", 0), 2)
+    # API V5 returns confidence as 0-100, but let's handle both 0-1 and 0-100
+    confidence_val = float(ai_confidence or 0)
+    if confidence_val <= 1.0: 
+        confidence_pct = round(confidence_val * 100, 1)
+    else:
+        confidence_pct = round(confidence_val, 1)
 
     log_json({
         "ai_prediction": ai_label,
@@ -84,7 +125,8 @@ try:
         "ai_details": {
             "benign_pct": benign_pct,
             "xss_pct": xss_pct,
-            "sqli_pct": sqli_pct
+            "sqli_pct": sqli_pct,
+            "cmdi_pct": round(probabilities.get("CMDi", 0), 2)
         },
         "ai_raw": ai_result,
         "rule_id": rule.get("id"),
@@ -94,7 +136,7 @@ try:
         "srcip": data.get("srcip") or alert_json.get("srcip"),
         "url": data.get("url") or alert_json.get("url"),
         "status": data.get("status") or alert_json.get("status"),
-        "full_log": log_content[:1000]
+        "full_log": full_log[:1000]
     })
 
 except Exception as e:

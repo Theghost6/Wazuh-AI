@@ -36,16 +36,9 @@ services:
       - API_PASSWORD=MyS3cr37P450r.*-
     entrypoint: /bin/bash
     command: >
-      -c "
-      cp /tmp/custom-ai-src /var/ossec/integrations/custom-ai;
-      chmod 750 /var/ossec/integrations/custom-ai;
-      chown root:wazuh /var/ossec/integrations/custom-ai;
-      sed -i 's/\r$$//' /var/ossec/integrations/custom-ai;
-      sed -i 's/\r$$//' /var/ossec/etc/rules/local_rules.xml 2>/dev/null || true;
-      mkdir -p /home/MRs && touch /home/MRs/test.log;
-      /init
-      "
+      -c "bash /tmp/init_custom_ai.sh"
     volumes:
+      - ./init_custom_ai.sh:/tmp/init_custom_ai.sh
       - wazuh_api_configuration:/var/ossec/api/configuration
       - wazuh_etc:/var/ossec/etc
       - wazuh_logs:/var/ossec/logs
@@ -133,4 +126,5 @@ volumes:
   wazuh-indexer-data:
   wazuh-dashboard-config:
   wazuh-dashboard-custom:
+
 
