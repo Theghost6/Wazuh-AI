@@ -15,6 +15,24 @@ import os
 MODEL_PATH = "attack_model.pt"  
 PORT = 5000  
 
+# Patterns to skip (High-entropy session junk)
+SKIP_PATTERNS = [
+    "rudderencrypt:",
+    "eyj", # JWT starting with 'eyJ'
+    "u2fsdgvkx1", # Salted Base64 (OpenSSL)
+    "wp-settings-",
+    "rl_page_",
+    "rl_anonymous_",
+    "rl_user_",
+    "n8n-auth",
+    "stoken=",
+    "csrf_token=",
+    "sessionid="
+]
+
+# Keys to ignore (UI Noise)
+IGNORE_KEYS = ["submit", "btnclear", "btnsubmit", "login", "button"]
+
 
 
 class SEBlock(nn.Module):  
@@ -78,11 +96,11 @@ def select_candidates(payloads, log_line, limit=MAX_CANDIDATES):
 
 
 def extract_payloads(log_line):  
-    """Extract payloads: URL, Referer, Body (gọn)"""  
+    """Extract payloads: URL and Body only (Aggressive filtering)"""  
     payloads = []  
     decode = lambda s: urllib.parse.unquote_plus(s) if s else s  
 
-    
+    # 1. Extract params from URL Query String
     m = re.search(r'\?([^\"]+?)(?:\s+HTTP|\s*")', log_line)  
     if m:  
         for p in m.group(1).split('&'):  
@@ -94,49 +112,67 @@ def extract_payloads(log_line):
                     if v2 != v:  
                         payloads.append(v2)  
 
-    
-    m = re.search(r'"\s+([a-zA-Z_]+=[^\"]+)$', log_line)  
-    if m:  
-        for p in m.group(1).split('&'):  
-            if '=' in p:  
-                payloads.append(decode(p.split('=', 1)[1]))  
+    # 2. Extract Body (last quoted field candidate)
+    # We find all quoted strings
+    quoted = re.findall(r'"([^"]*)"', log_line)
+    if not quoted:
+        return payloads
 
-    
-    m = re.search(r'"([^\"]+)"\s*$', log_line)  
-    if m:  
-        body = m.group(1)  
-        if body and body != '-' and not body.startswith('Mozilla') and not body.startswith('http'):  
-            if body.strip().startswith('{'):  
-                try:  
-                    import json  
-                    data = json.loads(body.replace('\\"', '"'))  
-                    def get_vals(obj):  
-                        if isinstance(obj, dict):  
-                            return [v for val in obj.values() for v in get_vals(val)]  
-                        elif isinstance(obj, list):  
-                            return [v for item in obj for v in get_vals(item)]  
-                        elif isinstance(obj, str) and len(obj) > 1:  
-                            return [obj]  
-                        return []  
-                    for v in get_vals(data):  
-                        payloads.append(v)  
-                except:  
-                    payloads.append(body)  
-            elif '=' in body:  
-                for p in body.split('&'):  
-                    if '=' in p:  
-                        v = decode(p.split('=', 1)[1])  
-                        if v and len(v) > 1:  
-                            payloads.append(v)  
-            elif len(body) > 2:  
-                payloads.append(body)  
+    # The request line is usually first, we analyze it for URL path
+    req_line = quoted[0]
+    # (Optional: we could extract path here, but detect_log uses the whole line anyway)
 
+    # We look at remaining quoted fields for the POST body
+    for field in reversed(quoted[1:]):
+        token = (field or "").strip()
+        low = token.lower()
+        
+        # Skip empty or dash
+        if not token or token == "-": continue
+        
+        # AGGRESSIVE FILTER: Skip anything that looks like a header or session junk
+        if any(low.startswith(h) for h in ["cookie:", "user-agent:", "referer:", "host:", "authorization:", "mozilla/", "http://", "https:"]):
+            continue
+        
+        # SKIP patterns (JWT, Encryption, Tracking)
+        if any(p in low for p in SKIP_PATTERNS):
+            continue
+
+        # If it contains '=' it is likely a form-data body
+        if "=" in token:
+            for p in token.split('&'):
+                if '=' in p:
+                    key, val = p.split('=', 1)
+                    # Skip noise keys
+                    if key.lower().strip() in IGNORE_KEYS:
+                        continue
+                    v = decode(val)
+                    if v and len(v) > 1:
+                        payloads.append(v)
+        # If it looks like JSON
+        elif token.startswith('{'):
+            try:
+                import json
+                data = json.loads(token.replace('\\"', '"'))
+                def get_vals(obj):
+                    if isinstance(obj, dict):
+                        return [v for val in obj.values() for v in get_vals(val)]
+                    elif isinstance(obj, list):
+                        return [v for item in obj for v in get_vals(item)]
+                    elif isinstance(obj, str) and len(obj) > 1:
+                        return [obj]
+                    return []
+                for v in get_vals(data):
+                    payloads.append(v)
+            except:
+                payloads.append(token)
+        
     return [p for p in payloads if p and len(p) > 1]  
 
 
 
 class AttackDetector:  
-    LABELS = {0: "Benign", 1: "XSS", 2: "SQLi", 3: "CMDi"}  
+    LABELS = {0: "Benign", 1: "XSS", 2: "SQLi", 3: "CMDi"}
     
     def __init__(self, model_path=MODEL_PATH, max_len=512):  
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  
@@ -149,6 +185,7 @@ class AttackDetector:
             self.model.eval()  
             print(f"Model loaded: {path} ({self.device})")  
 
+
     def tokenize(self, text):  
         tokens = [ord(c) if ord(c) < 256 else 1 for c in str(text)[:self.max_len]]  
         return torch.tensor([tokens + [0] * (self.max_len - len(tokens))], dtype=torch.long).to(self.device)  
@@ -158,20 +195,25 @@ class AttackDetector:
         with torch.no_grad():  
             probs = F.softmax(self.model(self.tokenize(text)), dim=1)[0]  
             pred = probs.argmax().item()  
+        
+        label = self.LABELS[pred]
         return {  
-            "label": self.LABELS[pred],  
+            "label": label,  
             "is_attack": pred != 0,  
-            "attack_type": self.LABELS[pred] if pred != 0 else None,  
+            "attack_type": label if pred != 0 else None,  
             "confidence": round(probs[pred].item() * 100, 2),  
             "detected_payload": text[:100],  
             "probabilities": {l: round(probs[i].item() * 100, 2) for i, l in self.LABELS.items()}  
         }  
 
-    def detect_log(self, log_line: str, threshold=0.5) -> dict:  
+    def detect_log(self, log_line: str, threshold=0.5, provided_candidates=None) -> dict:  
         """Detect attack trong HTTP log"""  
         best = {"pred": 0, "conf": 0, "payload": None, "probs": None}  
 
-        candidates = select_candidates(extract_payloads(log_line), log_line)  
+        if provided_candidates:
+            candidates = select_candidates(provided_candidates, log_line)
+        else:
+            candidates = select_candidates(extract_payloads(log_line), log_line)  
         for payload in candidates:  
             with torch.no_grad():  
                 probs = F.softmax(self.model(self.tokenize(payload)), dim=1)[0]  
@@ -199,6 +241,7 @@ detector = AttackDetector()
 class Request(BaseModel):  
     text: str = None  
     log: str = None  
+    payloads: list = None
     threshold: float = 0.5  
 
 @app.get("/")  
@@ -209,15 +252,21 @@ def home():
 def predict(req: Request):  
     """Predict - auto-detect if input is log or raw payload"""  
     start = time.time()  
-    content = req.text or req.log  
-    if not content:  
-        return JSONResponse(status_code=400, content={"error": "Missing text/log"})  
     
+    # Priority 1: Use pre-extracted payloads if provided (from custom-ai)
+    if req.payloads is not None:
+        res = detector.detect_log(req.log or "", req.threshold, provided_candidates=req.payloads)
     
-    if 'HTTP/' in content or (len(content) > 50 and re.search(r'\[\d+/\w+/\d+:', content)):  
-        res = detector.detect_log(content, req.threshold)  
-    else:  
-        res = detector.predict_single(content)  
+    # Priority 2: Use raw log if provided
+    elif req.log:
+        res = detector.detect_log(req.log, req.threshold)
+    
+    # Priority 3: Use text as raw payload
+    elif req.text:
+        res = detector.predict_single(req.text)
+    
+    else:
+        return JSONResponse(status_code=400, content={"error": "Missing log/payloads/text"})  
     
     if res["is_attack"]:  
         print(f"[ATTACK] {res['attack_type']} ({res['confidence']}%)")  

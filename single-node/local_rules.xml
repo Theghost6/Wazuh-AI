@@ -63,51 +63,56 @@
     <group>web,apache,nginx,ids,ai_test_group,</group>
   </rule>
 
-  <!-- XSS Detection - Level 14 (High) -->
+  <!-- XSS Detection - Level 14 (High Confidence) -->
   <rule id="100012" level="14">
     <if_sid>100011</if_sid>
     <field name="ai_prediction">^XSS$</field>
-    <description>🚨 AI PHÁT HIỆN TẤN CÔNG XSS - Độ tin cậy: $(ai_confidence_pct)% | XSS=$(ai_details.xss_pct)%, SQLi=$(ai_details.sqli_pct)%, Benign=$(ai_details.benign_pct)%</description>
+    <field name="ai_confidence_pct">^9[0-9]\.[0-9]|^100\.0</field>
+    <description>🚨 AI PHÁT HIỆN TẤN CÔNG XSS - Độ tin cậy cao: $(ai_confidence_pct)%</description>
     <group>attack,xss,ai_detection,</group>
   </rule>
 
-  <!-- SQLi Detection - Level 14 (High) -->
+  <!-- SQLi Detection - Level 14 (High Confidence) -->
   <rule id="100013" level="14">
     <if_sid>100011</if_sid>
     <field name="ai_prediction">^SQLi$</field>
-    <description>🚨 AI PHÁT HIỆN TẤN CÔNG SQL INJECTION - Độ tin cậy: $(ai_confidence_pct)% | SQLi=$(ai_details.sqli_pct)%, XSS=$(ai_details.xss_pct)%, Benign=$(ai_details.benign_pct)%</description>
+    <field name="ai_confidence_pct">^9[0-9]\.[0-9]|^100\.0</field>
+    <description>🚨 AI PHÁT HIỆN TẤN CÔNG SQL INJECTION - Độ tin cậy cao: $(ai_confidence_pct)%</description>
     <group>attack,sqli,ai_detection,</group>
   </rule>
 
-  <!-- Command Injection Detection - Level 14 (High) -->
+  <!-- Command Injection Detection - Level 14 (High Confidence) -->
   <rule id="100017" level="14">
     <if_sid>100011</if_sid>
     <field name="ai_prediction">^CMDi$</field>
-    <description>🚨 AI PHÁT HIỆN TẤN CÔNG COMMAND INJECTION - Độ tin cậy: $(ai_confidence_pct)% | CMDi=$(ai_details.cmdi_pct)%, SQLi=$(ai_details.sqli_pct)%, XSS=$(ai_details.xss_pct)%</description>
+    <field name="ai_confidence_pct">^9[0-9]\.[0-9]|^100\.0</field>
+    <description>🚨 AI PHÁT HIỆN TẤN CÔNG COMMAND INJECTION - Độ tin cậy cao: $(ai_confidence_pct)%</description>
     <group>attack,cmdi,ai_detection,</group>
   </rule>
 
-  <!-- Generic Attack (fallback) - Level 12 -->
-  <rule id="100014" level="12">
+  <!-- Suspicious Detections - Level 12 (Medium Confidence) -->
+  <rule id="100019" level="12">
+    <if_sid>100011</if_sid>
+    <field name="ai_prediction">^XSS$|^SQLi$|^CMDi$</field>
+    <field name="ai_confidence_pct">^8[0-9]\.[0-9]</field>
+    <description>⚠️ AI NGHI VẤN TẤN CÔNG $(ai_prediction) - Độ tin cậy: $(ai_confidence_pct)% | Cần kiểm tra lại</description>
+    <group>attack,ai_detection,suspicious,</group>
+  </rule>
+
+  <!-- Generic Attack (fallback) - Level 7 -->
+  <rule id="100014" level="7">
     <if_sid>100011</if_sid>
     <field name="ai_is_attack">^true$</field>
     <description>⚠️ AI CẢNH BÁO: Phát hiện $(ai_prediction) - Độ tin cậy: $(ai_confidence_pct)%</description>
     <group>attack,ai_detection,</group>
   </rule>
 
-  <!-- Override rule 31108 (level 0) to ensure POST requests are analyzed by AI -->
-  <rule id="100019" level="6">
-    <if_sid>31108</if_sid>
-    <match>POST</match>
-    <description>POST Request - AI Analysis Required (override 31108)</description>
-    <group>web,apache,nginx,ids,attack,</group>
-  </rule>
 
   <!-- Hook Rule: Forward ALL Web Logs to AI for analysis -->
-  <rule id="100018" level="6">
-    <decoded_as>web-accesslog</decoded_as>
-    <description>Web Access Log - AI Analysis Required</description>
-    <group>web,apache,nginx,ids,attack,</group>
+  <rule id="100018" level="3">
+    <if_sid>31100, 31101, 31103, 31106, 31108, 31122, 31151, 31164</if_sid>
+    <description>Web Access Log - AI Analysis Hook (Auto-Triggered)</description>
+    <group>ai_analysis_trigger,web,attack,</group>
   </rule>
 
   <!-- Benign - Level 3 (Info) -->

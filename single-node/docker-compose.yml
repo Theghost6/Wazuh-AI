@@ -7,6 +7,8 @@ services:
     restart: always
     ports:
       - "5000:5000"
+    volumes:
+      - ./AI:/app
 
   wazuh.manager:
     image: wazuh/wazuh-manager:4.14.2
@@ -56,7 +58,7 @@ services:
       - ./config/wazuh_cluster/wazuh_manager.conf:/wazuh-config-mount/etc/ossec.conf
       - ./local_rules.xml:/var/ossec/etc/rules/local_rules.xml
       - ./custom-ai:/tmp/custom-ai-src:ro
-      - ./shared:/var/ossec/etc/shared
+      - ./shared/default/agent.conf:/var/ossec/etc/shared/default/agent.conf
 
   wazuh.indexer:
     image: wazuh/wazuh-indexer:4.14.2

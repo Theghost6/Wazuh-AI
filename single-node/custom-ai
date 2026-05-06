@@ -16,6 +16,149 @@ def log_json(data):
     with open('/var/ossec/logs/active-responses.log', 'a') as f:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
+
+def _safe_unquote(value):
+    try:
+        return urllib.parse.unquote_plus(str(value))
+    except Exception:
+        return str(value)
+
+
+def _extract_url_body_method(alert_json, data, full_log):
+    """
+    Trích xuất chính xác POST Body, URL và Status dựa trên vị trí trong log format.
+    Format mặc định (Apache/Nginx): 
+    [IP] - - [DATE] "REQUEST" [STATUS] [SIZE] "REFERER" "UA" "COOKIE" "BODY"
+    """
+    method = ""
+    url = str(data.get("url") or alert_json.get("url") or "")
+    body = ""
+    status = str(data.get("status") or "")
+
+    # Ưu tiên các trường dữ liệu nếu Wazuh đã bóc tách sẵn
+    for key in ["body", "request_body", "post_data", "postdata", "data"]:
+        raw = data.get(key)
+        if isinstance(raw, str) and raw.strip():
+            body = raw.strip()
+            break
+
+    if full_log:
+        # Tìm tất cả các đoạn nằm trong dấu ngoặc kép
+        quoted_fields = re.findall(r'"([^"]*)"', full_log)
+        
+        # Tìm status code nếu chưa có (thường nằm sau dấu ngoặc kép đầu tiên)
+        if not status:
+            status_match = re.search(r'"\s+(\d{3})\s+', full_log)
+            if status_match:
+                status = status_match.group(1)
+
+        # 0. Robust Parse: Split by '" "' (the field separator for web logs)
+        # Standard web log fragments often look like: ... "REQ" 200 35 "REFERER" "AGENT" "COOKIE" "BODY"
+        # Split by '" "' ensures we don't break on a " inside a JSON cookie.
+        parts = full_log.split('" "')
+        
+        # Clean up the split results
+        clean_fields = []
+        for i, p in enumerate(parts):
+            f = p.strip()
+            if i == 0:
+                # First part: text before first " and the first quoted content
+                idx = f.find('"')
+                if idx != -1: f = f[idx+1:]
+            if i == len(parts) - 1:
+                # Last part: remove trailing "
+                if f.endswith('"'): f = f[:-1]
+            clean_fields.append(f)
+
+        # Log all fields for debugging
+        log_debug(f"Parser found {len(clean_fields)} fields")
+        for i, f in enumerate(clean_fields):
+            log_debug(f"  Field[{i}]: {f[:120]}...")
+
+        # 1. Extraction from request line (Field 0)
+        if len(clean_fields) >= 1:
+            req_line = clean_fields[0]
+            # Handle possible prepended status/size if split didn't catch it
+            req_match = re.search(r'([A-Z]+)\s+([^"\s]+)', req_line)
+            if req_match:
+                method = req_match.group(1).upper()
+                request_url = req_match.group(2).strip()
+                url = request_url
+
+        # 2. Candidate collection
+        samples = []
+        if url: samples.append(url)
+        
+        # 3. Handle POST Body (Field 4 usually in your format: REQ, REF, AGENT, COOKIE, BODY)
+        # We take the LAST field as Body if it's POST and has params
+        if method == "POST" and len(clean_fields) >= 4:
+            potential_body = clean_fields[-1]
+            if "=" in potential_body and len(potential_body) < 4000:
+                body = potential_body
+                samples.append(body)
+
+    log_debug(f"Final extraction: method={method}, url={url[:80]}, body_len={len(body)}")
+    return method, url, body, status
+
+
+def _collect_payload_parts(method, url, body):
+    parts = []
+
+    # 1. Process URL Path + Query
+    decoded_url = _safe_unquote(url).strip() if url else ""
+    if decoded_url:
+        # Keep the full decoded URL (e.g. /path?arg=val)
+        parts.append(decoded_url)
+        # If there's a query string, also extract individual values for better focus
+        if "?" in decoded_url:
+            query = decoded_url.split("?", 1)[1]
+            for _, value in urllib.parse.parse_qsl(query, keep_blank_values=False):
+                value = _safe_unquote(value).strip()
+                if len(value) > 2:
+                    parts.append(value)
+
+    # 2. Process POST Body
+    decoded_body = _safe_unquote(body).strip() if body else ""
+    if decoded_body:
+        # Keep the raw-ish body (decoded)
+        parts.append(decoded_body)
+        # Also extract specific values from the body if it's form-encoded
+        if "=" in decoded_body:
+            for _, value in urllib.parse.parse_qsl(decoded_body, keep_blank_values=False):
+                value = _safe_unquote(value).strip()
+                if len(value) > 2:
+                    parts.append(value)
+
+    # Final cleanup: Aggressive de-duplication and filter
+    IGNORE_KEYS = ["submit", "btnclear", "btnsign", "btnsubmit", "login", "button"]
+    filtered = []
+    seen = set()
+    for item in parts:
+        text = item.strip()
+        low = text.lower()
+        if len(text) < 3: continue 
+        if text in seen: continue
+        
+        # Skip common button labels if they are standalone
+        is_button = False
+        for k in IGNORE_KEYS:
+            if k in low and len(text) < 20:
+                is_button = True
+                break
+        if is_button: continue
+        # Double check no headers leaked in
+        skip = False
+        for noise in ["cookie:", "mozilla/", "http://", "https://", "host:", "user-agent:"]:
+            if low.startswith(noise):
+                skip = True
+                break
+        if skip: continue
+
+        seen.add(text)
+        filtered.append(text)
+
+    return filtered
+
 try:
     # 1. Đọc dữ liệu alert từ tham số Wazuh truyền vào
     alert_file = sys.argv[1]
@@ -29,35 +172,50 @@ try:
     # Skip AI-generated alerts to prevent recursion
     rule = alert_json.get("rule", {})
     rule_id = str(rule.get("id") or "")
-    if rule_id in ["100011", "100012", "100013", "100014", "100015", "100017"]:
+    groups = rule.get("groups", [])
+    location = alert_json.get("location", "")
+    
+    # Location filtered removed to allow analysis from any source (access.log or requests.log)
+    if rule_id in ["100010", "100011", "100012", "100013", "100014", "100015", "100017"] or "ai_detection" in groups:
         log_debug(f"Skip AI alert (rule {rule_id}) to prevent recursion")
         sys.exit(0)
+
     
-    # --- INTELLIGENT PAYLOAD EXTRACTION ---
-    # UPDATED: Send the FULL LOG to the API and let api.py handle extraction
-    # This ensures we don't miss attacks in POST Body, Referer, Headers, etc.
-    target_text = ""
-    
-    if full_log:
-        target_text = full_log
-        log_debug("Using full_log for AI analysis")
-    elif data.get("url"):
-        target_text = str(data.get("url"))
-        log_debug(f"Found URL field: {target_text}")
-    
-    if not target_text:
-        log_debug("No content to analyze, skipping")
+    # Extract only URL/body payloads to avoid header/cookie noise and reduce latency.
+    method, url, body, status_code = _extract_url_body_method(alert_json, data, full_log)
+
+    # RE-ENABLE 500 Skip: Skip analysis if the request is already blocked or resulted in 500
+    if status_code == "500":
+        log_debug(f"Skip alert with status 500 (already handled/blocked)")
         sys.exit(0)
-    
-    # URL Decode is NO LONGER NEEDED here because api.py handles it better
-    # And decoding full_log might break its structure
+
+    payload_parts = _collect_payload_parts(method, url, body)
+
+    if not payload_parts:
+        # Step 2: Fallback to request line parse ONLY if no specialized parts were found
+        req_match = re.search(r'"([A-Z]+)\s+([^"\s]+)\s+HTTP/[0-9.]+"', full_log or "")
+        if req_match:
+            raw_request_url = _safe_unquote(req_match.group(2))
+            if raw_request_url:
+                payload_parts = [raw_request_url]
+
+    # Note: We NO LONGER fall back to full_log here if payload_parts is still empty.
+    # This prevents sending high-entropy cookies/headers to the AI when URL/Body are clean.
+
+    # Use the parts directly as candidates for independent analysis
+    log_debug(f"Using URL/body payloads for AI analysis (method={method}, parts={len(payload_parts)}) samples={payload_parts[:3]}")
 
     # 2. Gửi sang AI API
     AI_API_URL = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else "http://ai-api:5000/predict"
     
     ai_result = {}
     try:
-        data_bytes = json.dumps({"text": target_text}).encode('utf-8')
+        # Send as a list of independent candidates to avoid noise from concatenation
+        req_data = {
+            "payloads": payload_parts[:10], # Send up to 10 candidates
+            "log": (alert_json.get('full_log', alert_json.get('log', '')) or "")[:2000]
+        }
+        data_bytes = json.dumps(req_data).encode('utf-8')
         req = urllib.request.Request(AI_API_URL, data=data_bytes, headers={'Content-Type': 'application/json'})
         
         with urllib.request.urlopen(req, timeout=5) as response:
@@ -93,6 +251,35 @@ try:
     if ai_is_attack is None:
         ai_is_attack = str(ai_label).lower() not in ("benign", "clean")
 
+    # 3. Sanity Check against False Positives
+    # If AI says XSS/SQLi/CMDi but payload has NO special chars, it's likely an FP
+    def check_sanity(label, payload):
+        label = label.lower()
+        payload = str(payload).lower()
+        if "xss" in label:
+            # XSS requires some form of tag or quotes/brackets
+            return any(c in payload for c in ['<', '>', '"', "'", '(', ')'])
+        if "sqli" in label:
+            # SQLi requires quotes, comments or semicolons
+            return any(c in payload for c in ["'", '"', "--", ";", "/*", "union", "select"])
+        if "cmdi" in label:
+            # CMDi requires command separators or redirections
+            return any(c in payload for c in [';', '|', '&', '$', '>', '<', '\\', '(', ')'])
+        return True
+
+    is_sane = any(check_sanity(ai_label, p) for p in payload_parts)
+    
+    # Final check for Alerting
+    confidence_val = float(ai_confidence or 0)
+    if confidence_val <= 1.0: confidence_pct_temp = confidence_val * 100
+    else: confidence_pct_temp = confidence_val
+    
+    # Be strict: If not sane and confidence not extremely high, it's NOT a confirmed attack
+    if ai_is_attack and not is_sane and confidence_pct_temp < 95:
+        log_debug(f"AI prediction '{ai_label}' failed sanity check for payloads. Downgrading to Benign.")
+        ai_is_attack = False
+        ai_label = "Benign"
+
     if not ai_is_attack:
         log_debug(f"Benign prediction ({ai_label}); skip active-responses log")
         sys.exit(0)
@@ -107,11 +294,16 @@ try:
     
     # Get detailed probabilities from AI response (V5 API returns "probabilities")
     probabilities = ai_result.get("probabilities", {})
-    benign_pct = round(probabilities.get("Benign", 0), 2)
-    xss_pct = round(probabilities.get("XSS", 0), 2)
-    sqli_pct = round(probabilities.get("SQLi", 0), 2)
-    # API V5 returns confidence as 0-100, but let's handle both 0-1 and 0-100
-    confidence_val = float(ai_confidence or 0)
+    def to_float(val):
+        try: return float(val) if val is not None else 0.0
+        except: return 0.0
+
+    benign_pct = round(to_float(probabilities.get("Benign", 0)), 2)
+    xss_pct = round(to_float(probabilities.get("XSS", 0)), 2)
+    sqli_pct = round(to_float(probabilities.get("SQLi", 0)), 2)
+    cmdi_pct = round(to_float(probabilities.get("CMDi", 0)), 2)
+    
+    # Final confidence normalization
     if confidence_val <= 1.0: 
         confidence_pct = round(confidence_val * 100, 1)
     else:
@@ -120,13 +312,13 @@ try:
     log_json({
         "ai_prediction": ai_label,
         "ai_confidence": ai_confidence,
-        "ai_confidence_pct": confidence_pct,
+        "ai_confidence_pct": "{:.1f}".format(confidence_pct),
         "ai_is_attack": ai_is_attack,
         "ai_details": {
             "benign_pct": benign_pct,
             "xss_pct": xss_pct,
             "sqli_pct": sqli_pct,
-            "cmdi_pct": round(probabilities.get("CMDi", 0), 2)
+            "cmdi_pct": cmdi_pct
         },
         "ai_raw": ai_result,
         "rule_id": rule.get("id"),
